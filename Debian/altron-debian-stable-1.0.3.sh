@@ -34,31 +34,6 @@ function random_password {
   password=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w $PASSWORD_LENGTH | head -n 1)
 }
 
-function backup_file {
-  local FILE=$1
-  
-  if [ ! -f $FILE ]; then
-    FNRET=1
-  else
-    local TARGET=$(echo $FILE | sed -s -e 's/\//./g' -e 's/^.//' -e "s/$/.$(date +%F-%H_%M_%S)/" )
-
-    cp -a $FILE "$BACKUPDIR/$TARGET"
-    FNRET=0
-  fi
-}
-
-function is_nx_supported_and_enabled {
-  if grep -q ' nx ' /proc/cpuinfo; then
-    if $SUDO_CMD grep -qi 'noexec=off' /proc/cmdline; then
-      FNRET=1
-    else
-      FNRET=0
-    fi
-  else
-    FNRET=1
-  fi
-}
-
 function has_sysctl_param_expected_result {
   local SYSCTL_PARAM=$1
   local EXP_RESULT=$2
@@ -80,16 +55,6 @@ function sysctl_set_param {
     FNRET=0
   elif [ $? = 255 ]; then
     FNRET=255
-  else
-    FNRET=1
-  fi
-}
-
-function dmesg_does_pattern_exist {
-  local PATTERN=$1
-
-  if $(dmesg | grep -qE "$PATTERN"); then
-    FNRET=0
   else
     FNRET=1
   fi
@@ -150,7 +115,6 @@ function append_to_file {
   local FILE=$1
   local LINE=$2
 
-  backup_file "$FILE"
   echo "$LINE" >> $FILE
 }
   
@@ -159,7 +123,6 @@ function file_addline_before_pattern {
   local LINE=$2
   local PATTERN=$3
 
-  backup_file "$FILE"
   PATTERN=$(sed 's@/@\\\/@g' <<< $PATTERN)
   sed -i "/$PATTERN/i $LINE" $FILE
   FNRET=0
@@ -170,7 +133,6 @@ function replace_in_file {
   local SOURCE=$2
   local DESTINATION=$3
 
-  backup_file "$FILE"
   SOURCE=$(sed 's@/@\\\/@g' <<< $SOURCE)
   sed -i "s/$SOURCE/$DESTINATION/g" $FILE
   FNRET=0
@@ -180,7 +142,6 @@ function delete_line_in_file {
   local FILE=$1
   local PATTERN=$2
 
-  backup_file "$FILE"
   PATTERN=$(sed 's@/@\\\/@g' <<< $PATTERN)
   sed -i "/$PATTERN/d" $FILE
   FNRET=0
@@ -248,7 +209,6 @@ function add_option_to_fstab {
   local PARTITION=$1
   local OPTION=$2
 
-  backup_file "/etc/fstab"
   sed -ie "s;\(.*\)\(\s*\)\s\($PARTITION\)\s\(\s*\)\(\w*\)\(\s*\)\(\w*\)*;\1\2 \3 \4\5\6\7,$OPTION;" /etc/fstab
 }
 
@@ -514,8 +474,6 @@ RESULT=$(df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -
 if [ ! -z "$RESULT" ]; then
   df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -type d -perm -0002 2>/dev/null | xargs chmod a+t
   logger "Fixed world writable directories\n"
-else
-  logger "All world writable directories have a sticky bit, nothing to apply\n"
 fi
 
 KERNEL_OPTIONS=(
@@ -723,16 +681,6 @@ else
   FNRET=1
 fi
 
-dmesg_does_pattern_exist $PATTERN
-if [ $FNRET != 0 ]; then
-  is_nx_supported_and_enabled
-  if [ $FNRET != 0 ]; then
-    logger "$PATTERN is not present in dmesg and NX seems unsupported or disabled\n"
-  else
-    logger "NX is supported and enabled\n"
-  fi
-fi
-
 PURGE_PACKAGES=(
   "prelink"
   "nis"
@@ -880,7 +828,6 @@ for i in ${!MASTER_PACKAGES[@]}; do
     if [ $FNRET = 0 ]; then
       file_does_pattern_exist $FILE $PATTERN
       if [ $FNRET = 0 ]; then
-        backup_file $FILE
         ESCAPED_PATTERN=$(sed "s/|\|(\|)/\\\&/g" <<< $PATTERN)
         sed -ie "s/$ESCAPED_PATTERN/#&/g" $FILE
       fi
@@ -918,7 +865,6 @@ for i in ${!MASTER_FILES[@]}; do
   if [ $FNRET = 0 ]; then
     file_does_pattern_exist $FILE $PATTERN
     if [ $FNRET = 0 ]; then
-      backup_file $FILE
       ESCAPED_PATTERN=$(sed "s/|\|(\|)/\\\&/g" <<< $PATTERN)
       sed -ie "s/$ESCAPED_PATTERN/#&/g" $FILE
     fi
@@ -927,224 +873,23 @@ done
 
 logger "Purged ${#MASTER_PATTERNS[@]} inetd.conf configurations\n"
 
-PACKAGE='ntp'
-NTP_CONF_DEFAULT_PATTERN='^restrict -4 default (kod nomodify notrap nopeer noquery|ignore)'
-NTP_CONF_FILE='/etc/ntp.conf'
-NTP_INIT_PATTERN='RUNASUSER=ntp'
-NTP_INIT_FILE='/etc/init.d/ntp'
-
-file_does_pattern_exist $NTP_CONF_FILE $NTP_CONF_DEFAULT_PATTERN
-if [ $FNRET != 0 ]; then
-  logger "Pattern not found in $NTP_CONF_FILE, adding it\n"
-  backup_file $NTP_CONF_FILE
-  append_to_file $NTP_CONF_FILE "restrict -4 default kod notrap nomodify nopeer noquery"
-fi
-
-file_does_pattern_exist $NTP_INIT_FILE "^$NTP_INIT_PATTERN"
-if [ $FNRET != 0 ]; then
-  logger "Pattern not found in $NTP_INIT_FILE, adding it\n"
-  backup_file $NTP_INIT_FILE
-  file_addline_before_pattern $NTP_INIT_FILE $NTP_INIT_PATTERN "^UGID"
-fi
-
-logger "Checking netport ports opened"
-RESULT=$(netstat -an | grep LIST | grep ":25[[:space:]]") || :
-RESULT=${RESULT:-}
-if [ -z "$RESULT" ]; then
-  logger "Nothing listens on 25 port, probably unix socket configured\n"
-else
-  if  $(grep -q "127.0.0.1" <<< $RESULT); then
-    logger "MTA is configured to localhost only\n"
-  else
-    logger "MTA listens worldwide, correct this considering your MTA\n"
-  fi
-fi
-:
-
-PACKAGE='rsync'
-RSYNC_DEFAULT_PATTERN='RSYNC_ENABLE=false'
-RSYNC_DEFAULT_FILE='/etc/default/rsync'
-RSYNC_DEFAULT_PATTERN_TO_SEARCH='RSYNC_ENABLE=true'
-
-is_pkg_installed $PACKAGE
-if [ $FNRET = 0 ]; then
-  file_does_pattern_exist $RSYNC_DEFAULT_FILE "^$RSYNC_DEFAULT_PATTERN"
-  if [ $FNRET != 0 ]; then
-    logger "Pattern not found in $RSYNC_DEFAULT_FILE, adding it\n"
-    backup_file $RSYNC_DEFAULT_FILE
-    replace_in_file $RSYNC_DEFAULT_FILE $RSYNC_DEFAULT_PATTERN_TO_SEARCH $RSYNC_DEFAULT_PATTERN
-  fi
-fi
-
-PACKAGE='tcpd'
-
-FILE='/etc/hosts.allow'
-
-check_file_existance $FILE
-if [ $FNRET != 0 ]; then
-  touch $FILE
-fi
-
-FILE='/etc/hosts.allow'
-PERMISSIONS='644'
-
-file_has_correct_permissions $FILE $PERMISSIONS
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct permissions\n"
-else
-  logger "Setting $FILE permissions to $PERMISSIONS\n"
-  chmod 0$PERMISSIONS $FILE
-fi
-
-FILE='/etc/hosts.deny'
-PATTERN='ALL: ALL'
-
-check_file_existance $FILE
-if [ $FNRET != 0 ]; then
-  touch $FILE
-fi
-file_does_pattern_exist $FILE "$PATTERN"
-if [ $FNRET != 0 ]; then
-  logger "$PATTERN is not present in $FILE, we have to deny everything\n"
-  append_to_file $FILE "$PATTERN"
-  logger "==========\n\nYOU MAY HAVE CUT YOUR ACCESS, CHECK BEFORE DISCONNECTING\n\n==========\n"
-fi
-
-FILE='/etc/hosts.deny'
-PERMISSIONS='644'
-
-file_has_correct_permissions $FILE $PERMISSIONS
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct permissions\n"
-else
-  logger "Setting $FILE permissions to $PERMISSIONS\n"
-  chmod 0$PERMISSIONS $FILE
-fi
-
-KERNEL_OPTION="CONFIG_AUDIT"
-
-is_kernel_option_enabled "^$KERNEL_OPTION="
-if [ $FNRET = 0 ]; then
-  logger "$KERNEL_OPTION is enabled\n"
-else
-  logger "I cannot fix $KERNEL_OPTION being disabled. To make auditd work, recompile your kernel please\n"
-fi
-:
-
-FILE='/etc/audit/auditd.conf'
-PATTERN='max_log_file'
-VALUE=5
-
-check_file_existance $FILE
-if [ $FNRET != 0 ]; then
-  touch $FILE
-fi
-file_does_pattern_exist $FILE "^$PATTERN[[:space:]]"
-if [ $FNRET != 0 ]; then
-  append_to_file $FILE "$PATTERN = $VALUE"
-fi
-
-FILE='/etc/audit/auditd.conf'
-OPTIONS='space_left_action=email action_mail_acct=root admin_space_left_action=halt'
-
-check_file_existance $FILE
-if [ $FNRET != 0 ]; then
-  touch $FILE
-fi
-for AUDIT_OPTION in $OPTIONS; do
-  AUDIT_PARAM=$(echo $AUDIT_OPTION | cut -d= -f 1)
-  AUDIT_VALUE=$(echo $AUDIT_OPTION | cut -d= -f 2)
-  PATTERN="^$AUDIT_PARAM[[:space:]]*=[[:space:]]*$AUDIT_VALUE"
-  file_does_pattern_exist $FILE "$PATTERN"
-  if [ $FNRET != 0 ]; then
-    file_does_pattern_exist $FILE "^$AUDIT_PARAM"
-    if [ $FNRET != 0 ]; then
-      append_to_file $FILE "$AUDIT_PARAM = $AUDIT_VALUE"
-    else
-      replace_in_file $FILE "^$AUDIT_PARAM[[:space:]]*=.*" "$AUDIT_PARAM = $AUDIT_VALUE"
-    fi
-  fi
-done
-
-FILE='/etc/audit/auditd.conf'
-OPTIONS='max_log_file_action=keep_logs'
-
-check_file_existance $FILE
-if [ $FNRET != 0 ]; then
-  echo "$FILE does not exist, creating it"
-  touch $FILE
-fi
-for AUDIT_OPTION in $OPTIONS; do
-  AUDIT_PARAM=$(echo $AUDIT_OPTION | cut -d= -f 1)
-  AUDIT_VALUE=$(echo $AUDIT_OPTION | cut -d= -f 2)
-  PATTERN="^$AUDIT_PARAM[[:space:]]*=[[:space:]]*$AUDIT_VALUE"
-  file_does_pattern_exist $FILE "$PATTERN"
-  if [ $FNRET != 0 ]; then
-    file_does_pattern_exist $FILE "^$AUDIT_PARAM"
-    if [ $FNRET != 0 ]; then
-      append_to_file $FILE "$AUDIT_PARAM = $AUDIT_VALUE"
-    else
-      replace_in_file $FILE "^$AUDIT_PARAM[[:space:]]*=.*" "$AUDIT_PARAM = $AUDIT_VALUE"
-    fi
-  fi
-done
-
-PACKAGE='auditd'
-SERVICE_NAME='auditd'
-
-is_service_enabled $SERVICE_NAME
-if [ $FNRET != 0 ]; then
-  logger "$SERVICE_NAME is not enabled, enabling it\n"
-  update-rc.d $SERVICE_NAME remove >  /dev/null 2>&1
-  update-rc.d $SERVICE_NAME defaults > /dev/null 2>&1
-fi
-
-FILE='/etc/default/grub'
-OPTIONS='GRUB_CMDLINE_LINUX="audit=1"'
-
-check_file_existance $FILE
-if [ $FNRET != 0 ]; then
-  touch $FILE
-fi
-for GRUB_OPTION in $OPTIONS; do
-  GRUB_PARAM=$(echo $GRUB_OPTION | cut -d= -f 1)
-  GRUB_VALUE=$(echo $GRUB_OPTION | cut -d= -f 2,3)
-  PATTERN="^$GRUB_PARAM=$GRUB_VALUE"
-  file_does_pattern_exist $FILE "$PATTERN"
-  if [ $FNRET != 0 ]; then
-    file_does_pattern_exist $FILE "^$GRUB_PARAM"
-    if [ $FNRET != 0 ]; then
-      append_to_file $FILE "$GRUB_PARAM = $GRUB_VALUE"
-    else
-      replace_in_file $FILE "^$GRUB_PARAM=.*" "$GRUB_PARAM=$GRUB_VALUE"
-    fi
-  fi
-done
-
 AUDIT_PARAMS=(
   "-a always,exit -F arch=b64 -S adjtimex -S settimeofday -k time-change"
   "-a always,exit -F arch=b32 -S adjtimex -S settimeofday -S stime -k time-change"
   "-a always,exit -F arch=b64 -S clock_settime -k time-change"
   "-a always,exit -F arch=b32 -S clock_settime -k time-change"
   "-w /etc/localtime -p wa -k time-change"
-  "-w /etc/group -p wa -k identity"
-  "-w /etc/passwd -p wa -k identity"
-  "-w /etc/gshadow -p wa -k identity"
-  "-w /etc/shadow -p wa -k identity"
-  "-w /etc/security/opasswd -p wa -k identity"
   "-a exit,always -F arch=b64 -S sethostname -S setdomainname -k system-locale"
   "-a exit,always -F arch=b32 -S sethostname -S setdomainname -k system-locale"
   "-w /etc/issue -p wa -k system-locale"
   "-w /etc/issue.net -p wa -k system-locale"
   "-w /etc/hosts -p wa -k system-locale"
   "-w /etc/network -p wa -k system-locale"
-  "-w /etc/selinux/ -p wa -k MAC-policy"
-  "-w /var/log/faillog -p wa -k logins"
-  "-w /var/log/lastlog -p wa -k logins"
-  "-w /var/log/tallylog -p wa -k logins"
-  "-w /var/run/utmp -p wa -k session"
-  "-w /var/log/wtmp -p wa -k session"
-  "-w /var/log/btmp -p wa -k session"
+  "-w /etc/group -p wa -k identity"
+  "-w /etc/passwd -p wa -k identity"
+  "-w /etc/gshadow -p wa -k identity"
+  "-w /etc/shadow -p wa -k identity"
+  "-w /etc/security/opasswd -p wa -k identity"
   "-a always,exit -F arch=b64 -S chmod -S fchmod -S fchmodat -F auid>=1000 -F auid!=4294967295 -k perm_mod"
   "-a always,exit -F arch=b32 -S chmod -S fchmod -S fchmodat -F auid>=1000 -F auid!=4294967295 -k perm_mod"
   "-a always,exit -F arch=b64 -S chown -S fchown -S fchownat -S lchown -F auid>=1000 -F auid!=4294967295 -k perm_mod"
@@ -1159,6 +904,13 @@ AUDIT_PARAMS=(
   "-a always,exit -F arch=b32 -S mount -F auid>=1000 -F auid!=4294967295 -k mounts"
   "-a always,exit -F arch=b64 -S unlink -S unlinkat -S rename -S renameat -F auid>=1000 -F auid!=4294967295 -k delete"
   "-a always,exit -F arch=b32 -S unlink -S unlinkat -S rename -S renameat -F auid>=1000 -F auid!=4294967295 -k delete"
+  "-w /etc/selinux/ -p wa -k MAC-policy"
+  "-w /var/log/faillog -p wa -k logins"
+  "-w /var/log/lastlog -p wa -k logins"
+  "-w /var/log/tallylog -p wa -k logins"
+  "-w /var/run/utmp -p wa -k session"
+  "-w /var/log/wtmp -p wa -k session"
+  "-w /var/log/btmp -p wa -k session"
   "-w /etc/sudoers -p wa -k sudoers"
   "-w /etc/sudoers.d/ -p wa -k sudoers"
   "-w /var/log/auth.log -p wa -k sudoaction"
@@ -1188,306 +940,13 @@ for i in ${!AUDIT_PARAMS[@]}; do
   logger "Applying auditd settings... ("$(($i + 1))"/${#AUDIT_PARAMS[@]}) - $AUDIT_VALUE"
 done
 
-SUDO_CMD='sudo -n'
-AUDIT_PARAMS1=$(find / -xdev \( -perm -4000 -o -perm -2000 \) -type f | awk '{print \
-"-a always,exit -F path=" $1 " -F perm=x -F auid>=1000 -F auid!=4294967295 \
--k privileged" }')
-FILE='/etc/audit/audit.rules'
-
-d_IFS=$IFS
-
-IFS=$'\n'
-for AUDIT_VALUE in $AUDIT_PARAMS1; do
-  file_does_pattern_exist $FILE $AUDIT_VALUE
-  if [ $FNRET != 0 ]; then
-    add_end_of_file $FILE $AUDIT_VALUE
-    eval $(pkill -HUP -P 1 auditd)
-  fi
-done
-
-logger "Applied ${#AUDIT_PARAMS[@]} auditd settings\n"
-
-IFS=$d_IFS
-
-SERVICE_NAME="syslog-ng"
-is_service_enabled $SERVICE_NAME
-if [ $FNRET != 0 ]; then
-  logger "Enabling $SERVICE_NAME...\n"
-  update-rc.d $SERVICE_NAME remove > /dev/null 2>&1
-  update-rc.d $SERVICE_NAME defaults > /dev/null 2>&1
-fi
-
-PERMISSIONS='640'
-USER='root'
-GROUP='adm'
-
-FILES=$(grep "file(" $SYSLOG_BASEDIR/syslog-ng.conf | grep '"' | cut -d'"' -f 2)
-
-for FILE in $FILES; do
-  check_file_existance $FILE
-  if [ $FNRET != 0 ]; then
-    touch $FILE
-  fi
-  file_has_correct_ownership $FILE $USER $GROUP
-  if [ $FNRET = 0 ]; then
-    logger "$FILE has correct ownership\n"
-  else
-    logger "Setting $FILE ownership to $USER:$GROUP...\n"
-    chown $USER:$GROUP $FILE
-  fi
-  file_has_correct_permissions $FILE $PERMISSIONS
-  if [ $FNRET = 0 ]; then
-    logger "$FILE has correct permissions\n"
-  else
-    logger "Setting $FILE permissions to $PERMISSIONS...\n"
-    chmod 0$PERMISSIONS $FILE
-  fi
-done
-
-PATTERN='^destination.*(tcp|udp)[[:space:]]*\([[:space:]]*\".*\"[[:space:]]*\)'
-
-FILES="$SYSLOG_BASEDIR/syslog-ng.conf $SYSLOG_BASEDIR/conf.d/*"
-file_does_pattern_exist "$FILES" "$PATTERN"
-if [ $FNRET != 0 ]; then
-  logger "$PATTERN is not present in $FILES, please set a remote host to send your logs\n"
-fi
-
 FILES='/etc/crontab /etc/cron.d/*'
 PATTERN='tripwire --check'
 
 file_does_pattern_exist "$FILES" "$PATTERN"
 if [ $FNRET != 0 ]; then
-  logger "$PATTERN is not present in $FILES, setting tripwire cron\n"
   echo "0 10 * * * root /usr/sbin/tripwire --check > /dev/shm/tripwire_check 2>&1 " > /etc/cron.d/CIS_8.3.2_tripwire
 fi
-
-PACKAGE="cron"
-SERVICE_NAME="cron"
-
-is_pkg_installed $PACKAGE
-if [ $FNRET != 0 ]; then
-  logger "$PACKAGE is absent. Installing it..."
-  apt_install $PACKAGE
-  is_service_enabled $SERVICE_NAME
-  if [ $FNRET != 0 ]; then
-    logger "Enabling $SERVICE_NAME...\n"
-    update-rc.d $SERVICE_NAME remove > /dev/null 2>&1
-    update-rc.d $SERVICE_NAME defaults > /dev/null 2>&1
-  fi
-fi 
-
-FILE='/etc/crontab'
-PERMISSIONS='600'
-USER='root'
-GROUP='root'
-
-check_file_existance $FILE
-if [ $FNRET != 0 ]; then
-  touch $FILE
-fi
-file_has_correct_ownership $FILE $USER $GROUP
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct ownership\n"
-else
-  logger "Setting $FILE ownership to $USER:$GROUP...\n"
-  chown $USER:$GROUP $FILE
-fi
-file_has_correct_permissions $FILE $PERMISSIONS
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct permissions\n"
-else
-  logger "Setting $FILE permissions to $PERMISSIONS...\n"
-  chmod 0$PERMISSIONS $FILE
-fi
-
-FILE='/etc/cron.hourly'
-PERMISSIONS='700'
-USER='root'
-GROUP='root'
-
-check_file_existance $FILE
-if [ $FNRET != 0 ]; then
-  touch $FILE
-fi
-
-file_has_correct_ownership $FILE $USER $GROUP
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct ownership\n"
-else
-  logger "Setting $FILE ownership to $USER:$GROUP...\n"
-  chown $USER:$GROUP $FILE
-fi
-
-file_has_correct_permissions $FILE $PERMISSIONS
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct permissions\n"
-else
-  logger "Setting $FILE permissions to $PERMISSIONS...\n"
-  chmod 0$PERMISSIONS $FILE
-fi
-
-FILE='/etc/cron.daily'
-PERMISSIONS='700'
-USER='root'
-GROUP='root'
-
-check_file_existance $FILE
-if [ $FNRET != 0 ]; then
-  logger "$FILE does not exist\n"
-  touch $FILE
-fi
-
-file_has_correct_ownership $FILE $USER $GROUP
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct ownership\n"
-else
-  logger "Setting $FILE ownership to $USER:$GROUP...\n"
-  chown $USER:$GROUP $FILE
-fi
-
-file_has_correct_permissions $FILE $PERMISSIONS
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct permissions\n"
-else
-  logger "Setting $FILE permissions to $PERMISSIONS...\n"
-  chmod 0$PERMISSIONS $FILE
-fi
-
-FILE='/etc/cron.weekly'
-PERMISSIONS='700'
-USER='root'
-GROUP='root'
-
-check_file_existance $FILE
-if [ $FNRET != 0 ]; then
-  logger "$FILE does not exist\n"
-  touch $FILE
-fi
-
-file_has_correct_ownership $FILE $USER $GROUP
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct ownership\n"
-else
-  logger "Setting $FILE ownership to $USER:$GROUP...\n"
-  chown $USER:$GROUP $FILE
-fi
-
-file_has_correct_permissions $FILE $PERMISSIONS
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct permissions\n"
-else
-  logger "Setting $FILE permissions to $PERMISSIONS...\n"
-  chmod 0$PERMISSIONS $FILE
-fi
-
-FILE='/etc/cron.monthly'
-PERMISSIONS='700'
-USER='root'
-GROUP='root'
-
-check_file_existance $FILE
-if [ $FNRET != 0 ]; then
-  logger "$FILE does not exist\n"
-  touch $FILE
-fi
-
-file_has_correct_ownership $FILE $USER $GROUP
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct ownership\n"
-else
-  logger "Setting $FILE ownership to $USER:$GROUP...\n"
-  chown $USER:$GROUP $FILE
-fi
-
-file_has_correct_permissions $FILE $PERMISSIONS
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct permissions\n"
-else
-  logger "Setting $FILE permissions to $PERMISSIONS...\n"
-  chmod 0$PERMISSIONS $FILE
-fi
-
-FILE='/etc/cron.d'
-PERMISSIONS='700'
-USER='root'
-GROUP='root'
-
-check_file_existance $FILE
-if [ $FNRET != 0 ]; then
-  logger "$FILE does not exist\n"
-  touch $FILE
-fi
-
-file_has_correct_ownership $FILE $USER $GROUP
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct ownership\n"
-else
-  logger "Setting $FILE ownership to $USER:$GROUP...\n"
-  chown $USER:$GROUP $FILE
-fi
-
-file_has_correct_permissions $FILE $PERMISSIONS
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct permissions\n"
-else
-  logger "Setting $FILE permissions to $PERMISSIONS...\n"
-  chmod 0$PERMISSIONS $FILE
-fi
-
-FILES_ABSENT='/etc/cron.deny /etc/at.deny'
-FILES_PRESENT='/etc/cron.allow /etc/at.allow'
-PERMISSIONS='644'
-USER='root'
-GROUP='root'
-
-for FILE in $FILES_PRESENT; do
-  check_file_existance $FILE
-  if [ $FNRET != 0 ]; then
-    touch $FILE
-  fi
-
-  file_has_correct_ownership $FILE $USER $GROUP
-  if [ $FNRET = 0 ]; then
-    logger "$FILE has correct ownership\n"
-else
-    logger "Setting $FILE ownership to $USER:$GROUP...\n"
-    chown $USER:$GROUP $FILE
-  fi
-
-  file_has_correct_permissions $FILE $PERMISSIONS
-  if [ $FNRET = 0 ]; then
-    chmod 0$PERMISSIONS $FILE
-  fi
-done
-
-PACKAGE='libpam-cracklib'
-PATTERN='^password.*pam_cracklib.so'
-FILE='/etc/pam.d/common-password'
-
-file_does_pattern_exist $FILE $PATTERN
-if [ $FNRET = 0 ]; then
-  echo "$PATTERN is present in $FILE"
-else
-  file_addline_before_pattern $FILE "password  requisite       pam_cracklib.so retry=3 minlen=8 difok=3" "# pam-auth-update(8) for details."
-fi 
-
-PACKAGE='libpam-modules-bin'
-PATTERN='^auth[[:space:]]*required[[:space:]]*pam_tally[2]?.so'
-FILE='/etc/pam.d/login'
-
-file_does_pattern_exist $FILE $PATTERN
-if [ $FNRET != 0 ]; then
-  file_addline_before_pattern $FILE "auth  required  pam_tally.so onerr=fail deny=6 unlock_time=1800" "# Uncomment and edit \/etc\/security\/time.conf if you need to set"
-fi 
-
-PACKAGE='libpam-modules'
-PATTERN='^password.*remember'
-FILE='/etc/pam.d/common-password'
-
-file_does_pattern_exist $FILE $PATTERN
-if [ $FNRET != 0 ]; then
-  file_addline_before_pattern $FILE "password [success=1 default=ignore] pam_unix.so obscure sha512 remember=5" "# pam-auth-update(8) for details."
-fi 
 
 PACKAGE='openssh-server'
 OPTIONS='Protocol=2'
@@ -1672,114 +1131,6 @@ done
 
 logger "Applied ${#MASTER_PACKAGE[@]} batch settings\n"
 
-PACKAGE='login'
-PATTERN='^auth[[:space:]]*required[[:space:]]*pam_wheel.so'
-FILE='/etc/pam.d/su'
-
-file_does_pattern_exist $FILE $PATTERN
-if [ $FNRET != 0 ]; then
-  file_addline_before_pattern $FILE "auth     required   pam_wheel.so" "# Uncomment this if you want wheel members to be able to"
-fi 
-
-SHELL='/bin/false'
-FILE='/etc/passwd'
-RESULT=''
-
-RESULT=$(egrep -v "^\+" $FILE | awk -F: '($1!="root" && $1!="sync" && $1!="shutdown" && $1!="halt" && $3<1000 && $7!="/usr/sbin/nologin" && $7!="/bin/false") {print}')
-
-d_IFS=$IFS
-IFS=$'\n'
-
-for LINE in $RESULT; do
-  ACCOUNT=$( echo $LINE | cut -d: -f 1 )
-  if echo "$EXCEPTIONS" | grep -q $ACCOUNT; then
-    RESULT=$(sed "s!$LINE!!" <<< "$RESULT")
-  fi
-done
-if [ ! -z "$RESULT" ]; then
-  logger "Some admin accounts don't have $SHELL as their login shell. Fixing...\n"
-  for USER in $( echo "$RESULT" | cut -d: -f 1 ); do
-    usermod -s $SHELL $USER
-  done
-fi
-
-IFS=$d_IFS
-
-USER='root'
-EXPECTED_GID='0'
-
-if [ $(grep "^root:" /etc/passwd | cut -f4 -d:) != 0 ]; then
-  logger "Root group GID is not $EXPECTED_GID. Fixing...\n"
-  usermod -g $EXPECTED_GID $USER
-fi
-
-USER='root'
-PATTERN='umask 077'
-FILES_TO_SEARCH='/etc/bash.bashrc /etc/profile.d /etc/profile'
-FILE='/etc/profile.d/CIS_10.4_umask.sh'
-
-SEARCH_RES=0
-for FILE_SEARCHED in $FILES_TO_SEARCH; do
-  if [ $SEARCH_RES = 1 ]; then break; fi
-  if test -d $FILE_SEARCHED; then
-    for file_in_dir in $(ls $FILE_SEARCHED); do
-      file_does_pattern_exist "$FILE_SEARCHED/$file_in_dir" "^$PATTERN"
-      if [ $FNRET = 0 ]; then
-        SEARCH_RES=1
-        break
-      fi
-    done
-  else
-    file_does_pattern_exist "$FILE_SEARCHED" "^$PATTERN"
-    if [ $FNRET = 0 ]; then
-      SEARCH_RES=1
-    fi
-  fi
-done
-
-if [ $SEARCH_RES = 0 ]; then
-  touch $FILE
-  chmod 644 $FILE
-  append_to_file $FILE "$PATTERN"
-fi
-
-PERMISSIONS='644'
-USER='root'
-GROUP='root'
-FILES=("/etc/motd" "/etc/issue" "/etc/issue.net")
-
-for FILE in $FILES; do
-  check_file_existance $FILE
-  if [ $FNRET != 0 ]; then
-    logger "$FILE does not exist\n"
-    touch $FILE 
-  fi
-  file_has_correct_ownership $FILE $USER $GROUP
-  if [ $FNRET = 0 ]; then
-  logger "$FILE has correct ownership\n"
-else
-    logger "Setting $FILE ownership to $USER:$GROUP...\n"
-    chown $USER:$GROUP $FILE
-  fi
-  file_has_correct_permissions $FILE $PERMISSIONS
-  if [ $FNRET = 0 ]; then
-  logger "$FILE has correct permissions\n"
-else
-    logger "Setting $FILE permissions to $PERMISSIONS...\n"
-    chmod 0$PERMISSIONS $FILE
-  fi
-done
-
-FILES='/etc/motd /etc/issue /etc/issue.net'
-PATTERN='(\\v|\\r|\\m|\\s)'
-
-for FILE in $FILES; do
-  file_does_pattern_exist $FILE "$PATTERN"
-  if [ $FNRET = 0 ]; then
-    delete_line_in_file $FILE $PATTERN
-  fi
-done
-
 FILE='/etc/passwd'
 PERMISSIONS='644'
 
@@ -1837,64 +1188,10 @@ else
   chown $USER:$GROUP $FILE
 fi
 
-FILE='/etc/group'
-USER='root'
-GROUP='root'
-
-file_has_correct_ownership $FILE $USER $GROUP
-if [ $FNRET = 0 ]; then
-  logger "$FILE has correct ownership\n"
-else
-  logger "Setting $FILE ownership to $USER:$GROUP...\n"
-  chown $USER:$GROUP $FILE
-fi
-
 RESULT=$(df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -type f -perm -0002 -print 2>/dev/null)
 if [ ! -z "$RESULT" ]; then
   logger "Fixing world writable files...\n"
   df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -type f -perm -0002 -print 2>/dev/null|  xargs chmod o-w
-fi
-
-USER='root'
-
-RESULT=$(df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -nouser -ls 2>/dev/null)
-if [ ! -z "$RESULT" ]; then
-  logger "Applying chown on all unowned files in the system\n"
-  df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -nouser -print 2>/dev/null | xargs chown $USER
-fi
-
-GROUP='root'
-
-RESULT=$(df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -nogroup -ls 2>/dev/null)
-if [ ! -z "$RESULT" ]; then
-  logger "Applying chgrp on all ungrouped files in the system\n"
-  df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -nogroup -print 2>/dev/null | xargs chgrp $GROUP
-fi
-RESULT=$(df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -type f -perm -4000 -print 2>/dev/null)
-for BINARY in $RESULT; do
-  if grep -q $BINARY <<< "$EXCEPTIONS"; then
-    RESULT=$(sed "s!$BINARY!!" <<< $RESULT)
-  fi
-done
-if [ ! -z "$RESULT" ]; then
-  logger "Some suid files are present (suid.txt)\n"
-  FORMATTED_RESULT=$(sed "s/ /\n/g" <<< $RESULT | sort | uniq | tr '\n' ' ')
-  echo "$FORMATTED_RESULT" > suid.txt
-else
-  logger "No unknown suid files found\n"
-fi
-RESULT=$(df --local -P | awk {'if (NR!=1) print $6'} | xargs -I '{}' find '{}' -xdev -type f -perm -2000 -print 2>/dev/null)
-for BINARY in $RESULT; do
-  if grep -q $BINARY <<< "$EXCEPTIONS"; then
-    RESULT=$(sed "s!$BINARY!!" <<< $RESULT)
-  fi
-done
-if [ ! -z "$RESULT" ]; then
-  logger "Some sgid files are present (sgid.txt)\n"
-  FORMATTED_RESULT=$(sed "s/ /\n/g" <<< $RESULT | sort | uniq | tr '\n' ' ')
-  echo "$FORMATTED_RESULT" > sgid.txt
-else
-  logger "No unknown sgid files found\n"
 fi
 
 FILE='/etc/shadow'
@@ -1956,7 +1253,7 @@ done
 if [ ! -z "$RESULT" ]; then
   logger "Some accounts have uid 0\n"
 else
-  logger "No account with uid 0 appart from root and potential configured exceptions\n"
+  logger "No account with uid 0 apart from root and potential configured exceptions\n"
 fi
 
 ERRORS=0
@@ -1998,71 +1295,6 @@ else
   logger "ROOT PATH IS NOT SECURE!\n"
 fi
 
-for dir in $(cat /etc/passwd | /bin/egrep -v '(root|halt|sync|shutdown)' | awk -F: '($7 != "/usr/sbin/nologin" && $7 != "/bin/false" && $7 !="/nonexistent" ) { print $6 }'); do
-  if echo "$EXCEPTIONS" | grep -q $dir; then
-    RESULT=$(sed "s!$dir!!" <<< "$RESULT")
-  fi
-  if [ -d $dir ]; then
-    dirperm=$(/bin/ls -ld $dir | cut -f1 -d" ")
-    if [ $(echo $dirperm | cut -c6 ) != "-" ]; then
-      chmod g-w $dir
-    fi
-    if [ $(echo $dirperm | cut -c8 ) != "-" ]; then
-      chmod o-r $dir
-    fi
-    if [ $(echo $dirperm | cut -c9 ) != "-" ]; then
-      chmod o-w $dir
-    fi
-    if [ $(echo $dirperm | cut -c10 ) != "-" ]; then
-      chmod o-x $dir
-    fi
-  fi
-done
-
-for DIR in $(cat /etc/passwd | egrep -v '(root|halt|sync|shutdown)' | awk -F: '($7 != "/usr/sbin/nologin" && $7 != "/bin/false" && $7 !="/nonexistent" ) { print $6 }'); do
-  for FILE in $DIR/.[A-Za-z0-9]*; do
-    if [ ! -h "$FILE" -a -f "$FILE" ]; then
-      FILEPERM=$(ls -ld $FILE | cut -f1 -d" ")
-      if [ $(echo $FILEPERM | cut -c6) != "-" ]; then
-        chmod g-w $FILE
-      fi
-      if [ $(echo $FILEPERM | cut -c9) != "-" ]; then
-        chmod o-w $FILE
-      fi
-    fi
-  done
-done
-
-PERMISSIONS="600"
-
-for DIR in $(cat /etc/passwd | egrep -v '(root|halt|sync|shutdown)' | awk -F: '($7 != "/usr/sbin/nologin" && $7 != "/bin/false" && $7 !="/nonexistent" ) { print $6 }'); do
-  for FILE in $DIR/.netrc; do
-    if [ ! -h "$FILE" -a -f "$FILE" ]; then
-      file_has_correct_permissions $FILE $PERMISSIONS
-      if [ $FNRET = 0 ]; then
-        logger "$FILE has correct permissions\n"
-      else
-        chmod 600 $FILE
-      fi
-    fi
-  done
-done
-
-ERRORS=0
-FILENAME=".rhosts"
-
-for DIR in $(cat /etc/passwd | egrep -v '(root|halt|sync|shutdown)' | awk -F: '($7 != "/usr/sbin/nologin" && $7 != "/bin/false" && $7 !="/nonexistent" ) { print $6 }'); do
-  for FILE in $DIR/$FILENAME; do
-    if [ ! -h "$FILE" -a -f "$FILE" ]; then
-      ERRORS=$((ERRORS+1))
-    fi
-  done
-done
-
-if [ $ERRORS = 0 ]; then
-  logger "No $FILENAME present in users home directory\n"
-fi
-
 ERRORS=0
 
 for GROUP in $(cut -s -d: -f4 /etc/passwd | sort -u ); do
@@ -2072,7 +1304,7 @@ for GROUP in $(cut -s -d: -f4 /etc/passwd | sort -u ); do
 done
 
 if [ $ERRORS = 0 ]; then
-  logger "passwd and group groups are consistent\n"
+  logger "passwd and group groups are good\n"
 fi
 
 ERRORS=0
@@ -2091,15 +1323,6 @@ done
 if [ $ERRORS = 0 ]; then
   echo "All home directories exists" >> $USER_DIRS
 fi
-
-cat /etc/passwd | awk -F: '{ print $1 " " $3 " " $6 }' | while read USER USERID DIR; do
-  if [[ $USERID -ge 500 && -d "$DIR" && $USER != "nfsnobody" ]]; then
-    OWNER=$(stat -L -c "%U" "$DIR")
-    if [ "$OWNER" != "$USER" ]; then
-      chown $USER $DIR
-    fi
-  fi
-done
 
 ERRORS=0
 
@@ -2168,130 +1391,6 @@ done
 if [ $ERRORS = 0 ]; then
   echo "No duplicate groupnames" >> $DUPLICATES_FILE
 fi 
-
-ERRORS=0
-FILENAME='.netrc'
-
-for DIR in $(cat /etc/passwd | egrep -v '(root|halt|sync|shutdown)' | awk -F: '($7 != "/usr/sbin/nologin" && $7 != "/bin/false" && $7 !="/nonexistent" ) { print $6 }'); do
-  for FILE in $DIR/$FILENAME; do
-    if [ ! -h "$FILE" -a -f "$FILE" ]; then
-      ERRORS=$((ERRORS+1))
-    fi
-  done
-done
-
-if [ $ERRORS = 0 ]; then
-  logger "No $FILENAME present in users home directory\n"
-fi
-
-ERRORS=0
-FILENAME='.forward'
-
-for DIR in $(cat /etc/passwd | egrep -v '(root|halt|sync|shutdown)' | awk -F: '($7 != "/usr/sbin/nologin" && $7 != "/bin/false" && $7 !="/nonexistent" ) { print $6 }'); do
-  for FILE in $DIR/$FILENAME; do
-    if [ ! -h "$FILE" -a -f "$FILE" ]; then
-      ERRORS=$((ERRORS+1))
-    fi
-  done
-done
-
-if [ $ERRORS = 0 ]; then
-  logger "No $FILENAME present in users home directory\n"
-fi
-
-ERRORS=0
-FILEGROUP='/etc/group'
-PATTERN='^shadow:x:[[:digit:]]+:'
-
-file_does_pattern_exist $FILEGROUP $PATTERN
-if [ $FNRET = 0 ]; then
-  RESULT=$(grep -E "$PATTERN" $FILEGROUP | cut -d: -f4)
-  GROUPID=$(getent group shadow | cut -d: -f3)
-  if [ ! -z "$RESULT" ]; then
-    logger "Some users belong to shadow group: $RESULT\n"
-  else
-    logger "No user belongs to shadow group\n"
-  fi
-
-  RESULT=$(awk -F: '($4 == shadowid) { print $1 }' shadowid=$GROUPID /etc/passwd)
-  if [ ! -z "$RESULT" ]; then
-    logger "Some users have shadow id as their primary group: $RESULT\n"
-  else
-    logger "No user has shadow id as their primary group\n"
-  fi
-else
-  logger "shadow group doesn't exist\n"
-fi
-
-USER='root'
-PATTERN='TMOUT='
-VALUE='600'
-FILES_TO_SEARCH='/etc/bash.bashrc /etc/profile.d /etc/profile'
-FILE='/etc/profile.d/CIS_99.1_timeout.sh'
-
-SEARCH_RES=0
-for FILE_SEARCHED in $FILES_TO_SEARCH; do
-  if [ $SEARCH_RES = 1 ]; then break; fi
-  if test -d $FILE_SEARCHED; then
-    for file_in_dir in $(ls $FILE_SEARCHED); do
-      file_does_pattern_exist "$FILE_SEARCHED/$file_in_dir" "^$PATTERN"
-      if [ $FNRET = 0 ]; then
-        SEARCH_RES=1
-        break
-      fi
-    done
-  else
-    file_does_pattern_exist "$FILE_SEARCHED" "^$PATTERN"
-    if [ $FNRET = 0 ]; then
-      SEARCH_RES=1
-    fi
-  fi
-done
-if [ $SEARCH_RES = 0 ]; then
-  touch $FILE
-  chmod 644 $FILE
-  append_to_file $FILE "$PATTERN$VALUE"
-  append_to_file $FILE "readonly TMOUT"
-  append_to_file $FILE "export TMOUT"
-fi
-
-USER='root'
-PATTERN='ACTION=="add", SUBSYSTEMS=="usb", TEST=="authorized_default", ATTR{authorized_default}="0"'
-FILES_TO_SEARCH='/etc/udev/rules.d'
-FILE='/etc/udev/rules.d/10-CIS_99.2_usb_devices.sh'
-
-SEARCH_RES=0
-for FILE_SEARCHED in $FILES_TO_SEARCH; do
-  if [ $SEARCH_RES = 1 ]; then break; fi
-  if test -d $FILE_SEARCHED; then
-    for file_in_dir in $(ls $FILE_SEARCHED); do
-      file_does_pattern_exist "$FILE_SEARCHED/$file_in_dir" "^$PATTERN"
-      if [ $FNRET = 0 ]; then
-        SEARCH_RES=1
-        break
-      fi
-    done
-  else
-    file_does_pattern_exist "$FILE_SEARCHED" "^$PATTERN"
-    if [ $FNRET = 0 ]; then
-      SEARCH_RES=1
-    fi
-  fi
-done
-if [ $SEARCH_RES = 0 ]; then
-  touch $FILE
-  chmod 644 $FILE
-  append_to_file $FILE '
-
-ACTION=="add", SUBSYSTEMS=="usb", TEST=="authorized_default", ATTR{authorized_default}="0"
-
-ACTION=="add", ATTR{bDeviceClass}=="09", TEST=="authorized", ATTR{authorized}="1"
-
-ACTION=="add", ATTR{product}=="*[Kk]eyboard*", TEST=="authorized", ATTR{authorized}="1"
-
-ACTION=="add", ATTR{product}=="*Thinnet TM*", TEST=="authorized", ATTR{authorized}="1"
-'
-fi
 
 logger "Installing RKHunter..."
 apt_install "rkhunter"
@@ -2364,6 +1463,7 @@ logger "Updating Firefox settings... (looking for profile)"
 profile=$(ls /home/${SUDO_USER}/.mozilla/firefox | grep .default$)
 logger "Updating Firefox settings... (found profile ${profile})"
 
+# TODO: Add this into a loop.
 sed -i '/browser.safebrowsing.downloads.remote.block_uncommon/d' /home/${SUDO_USER}/.mozilla/firefox/$profile/prefs.js >> $LOG_FILE 2>&1
 sed -i '/browser.safebrowsing.malware.enabled/d' /home/${SUDO_USER}/.mozilla/firefox/$profile/prefs.js >> $LOG_FILE 2>&1
 sed -i '/browser.safebrowsing.phishing.enabled/d' /home/${SUDO_USER}/.mozilla/firefox/$profile/prefs.js >> $LOG_FILE 2>&1
@@ -2452,7 +1552,7 @@ function display_time {
 echo ""
 echo " ========================================"
 echo ""
-echo "  Script made by Matteo Polak for Altron"
+echo "  Script made by Matteo Polak for Plagueware"
 echo ""
 printf "     This script executed in "
 display_time $SECONDS
